@@ -1,204 +1,412 @@
-import { supabase } from '../lib/supabase';
+/**
+ * Form Submission Service
+ * Handles form submission to Supabase Edge Functions and payment processing
+ * Integrates with Claude AI Call Agent system
+ */
 
-export interface FormField {
-  id: string;
-  label: string;
-  type: 'text' | 'email' | 'phone';
-  required: boolean;
-  value: string;
-}
-
-export interface AdditionalQuestion {
+interface AdditionalQuestion {
   id: string;
   question: string;
-  type: 'text' | 'select' | 'boolean';
-  options?: string[];
   required: boolean;
 }
 
-export interface CallSession {
-  sessionId: string;
-  agentId: string;
-  clientPhone: string;
-  collectedData: Record<string, any>;
-  currentStep: 'greeting' | 'collecting' | 'confirming' | 'booking' | 'complete';
-  interruptionCount: number;
+interface FormSubmission {
+  name: string;
+  email: string;
+  phone: string;
+  additionalQuestions: AdditionalQuestion[];
+  additionalAnswers: Record<string, string>;
+  timestamp: string;
 }
 
-export interface ServiceResponse<T> {
-  data?: T;
+interface SubmissionResponse {
+  success: boolean;
+  apiNumber?: string;
   error?: string;
 }
 
-class FormSubmissionService {
-  private readonly baseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL + '/functions/v1';
-  private readonly retryDelay = 1000;
-  private readonly maxRetries = 3;
+interface PaymentData {
+  amount: number;
+  description: string;
+}
 
-  private async makeRequest<T>(
-    endpoint: string, 
-    data: any, 
-    retryCount = 0
-  ): Promise<ServiceResponse<T>> {
+interface PaymentResponse {
+  success: boolean;
+  transactionId?: string;
+  error?: string;
+}
+
+/**
+ * Service configuration
+ */
+const SERVICE_CONFIG = {
+  // Supabase Edge Function endpoints
+  FORM_SUBMISSION_ENDPOINT: '/api/form-submission/submit',
+  PAYMENT_ENDPOINT: '/api/payments/process',
+  
+  // Retry configuration
+  MAX_RETRIES: 3,
+  RETRY_DELAY: 1000, // 1 second
+  
+  // API timeout
+  REQUEST_TIMEOUT: 30000, // 30 seconds
+};
+
+/**
+ * Utility function to generate unique API number for Claude AI Call Agent
+ */
+const generateApiNumber = (): string => {
+  const prefix = 'CA'; // Claude Agent
+  const timestamp = Date.now().toString(36).toUpperCase();
+  const random = Math.random().toString(36).substring(2, 8).toUpperCase();
+  return `${prefix}-${timestamp}-${random}`;
+};
+
+/**
+ * Utility function to implement retry logic with exponential backoff
+ */
+const retryWithBackoff = async <T>(
+  operation: () => Promise<T>,
+  maxRetries: number = SERVICE_CONFIG.MAX_RETRIES,
+  delay: number = SERVICE_CONFIG.RETRY_DELAY
+): Promise<T> => {
+  let lastError: Error;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session) {
-        return { error: 'Authentication required' };
-      }
-
-      const response = await fetch(`${this.baseUrl}${endpoint}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${session.access_token}`,
-        },
-        body: JSON.stringify(data),
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      const result = await response.json();
-      return { data: result };
-
+      return await operation();
     } catch (error) {
-      if (retryCount < this.maxRetries) {
-        await new Promise(resolve => setTimeout(resolve, this.retryDelay * (retryCount + 1)));
-        return this.makeRequest<T>(endpoint, data, retryCount + 1);
-      }
+      lastError = error as Error;
       
-      return { error: error instanceof Error ? error.message : 'Unknown error' };
+      if (attempt === maxRetries) {
+        throw lastError;
+      }
+
+      // Exponential backoff
+      const backoffDelay = delay * Math.pow(2, attempt - 1);
+      await new Promise(resolve => setTimeout(resolve, backoffDelay));
     }
   }
 
-  async processPayment(payload: {
-    fields: FormField[];
-    agentType: string;
-  }): Promise<ServiceResponse<{
-    agentId: string;
-    formLink: string;
-    webhookLink?: string;
-  }>> {
-    return this.makeRequest('/form-submission-payment', {
-      fields: payload.fields,
-      agentType: payload.agentType,
-      timestamp: new Date().toISOString(),
-    });
-  }
+  throw lastError!;
+};
 
-  async deployAgent(payload: {
-    agentId: string;
-    coreFields: FormField[];
-    additionalQuestions: AdditionalQuestion[];
-    formLink: string;
-    webhookLink?: string;
-  }): Promise<ServiceResponse<{ success: boolean }>> {
-    return this.makeRequest('/deploy-form-agent', {
-      ...payload,
-      aiInstructions: this.generateAIInstructions(payload.coreFields, payload.additionalQuestions),
-      timestamp: new Date().toISOString(),
-    });
-  }
+/**
+ * Utility function to make HTTP requests with timeout
+ */
+const makeRequest = async <T>(
+  url: string,
+  options: RequestInit,
+  timeout: number = SERVICE_CONFIG.REQUEST_TIMEOUT
+): Promise<T> => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
 
-  async handleIncomingCall(payload: {
-    agentId: string;
-    clientPhone: string;
-    sessionId?: string;
-  }): Promise<ServiceResponse<CallSession>> {
-    return this.makeRequest('/handle-call', {
-      ...payload,
-      callType: 'form_submission',
-      timestamp: new Date().toISOString(),
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
     });
-  }
 
-  async processCallMessage(payload: {
-    sessionId: string;
-    message: string;
-    isInterruption?: boolean;
-    audioLevel?: number;
-  }): Promise<ServiceResponse<{
-    response: string;
-    nextStep: string;
-    shouldCollectMore: boolean;
-    bookingAvailable: boolean;
-  }>> {
-    return this.makeRequest('/process-call-message', {
-      ...payload,
-      timestamp: new Date().toISOString(),
-    });
-  }
+    clearTimeout(timeoutId);
 
-  async confirmCollectedData(payload: {
-    sessionId: string;
-    collectedData: Record<string, any>;
-  }): Promise<ServiceResponse<{
-    confirmationMessage: string;
-    isAccurate: boolean;
-  }>> {
-    return this.makeRequest('/confirm-data', {
-      ...payload,
-      timestamp: new Date().toISOString(),
-    });
-  }
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
 
-  async bookAppointment(payload: {
-    sessionId: string;
-    preferredDate?: string;
-    preferredTime?: string;
-  }): Promise<ServiceResponse<{
-    bookingConfirmed: boolean;
-    appointmentDetails?: {
-      date: string;
-      time: string;
-      meetingLink?: string;
+    return await response.json();
+  } catch (error) {
+    clearTimeout(timeoutId);
+    throw error;
+  }
+};
+
+/**
+ * Form Submission Service
+ * Main service object with methods for form submission and payment processing
+ */
+export const formSubmissionService = {
+  /**
+   * Submit form data to Supabase Edge Function
+   * Creates Claude AI Call Agent configuration and returns API number
+   */
+  async submitForm(formData: FormSubmission): Promise<SubmissionResponse> {
+    try {
+      // Generate unique API number for the Claude AI Call Agent
+      const apiNumber = generateApiNumber();
+
+      // Prepare submission payload with Claude AI integration data
+      const submissionPayload = {
+        ...formData,
+        apiNumber,
+        claudeAgentConfig: {
+          // Claude AI Call Agent configuration
+          conversationMission: {
+            objective: 'Prequalify client and book appointment',
+            requiredFields: ['name', 'email', 'phone'],
+            additionalQuestions: formData.additionalQuestions.map(q => ({
+              id: q.id,
+              question: q.question,
+              required: q.required
+            })),
+            conversationFlow: [
+              'greet_professionally',
+              'collect_required_fields',
+              'ask_additional_questions',
+              'confirm_answers',
+              'schedule_appointment',
+              'close_politely'
+            ]
+          },
+          guardrails: {
+            neverRevealInternalStructure: true,
+            noSpeculation: true,
+            respondOnlyFromBusinessContext: true,
+            maintainProfessionalTone: true
+          },
+          integrations: {
+            appointmentBooking: true,
+            emailNotifications: true,
+            crmIntegration: true
+          }
+        }
+      };
+
+      // Submit with retry logic
+      const response = await retryWithBackoff(async () => {
+        return await makeRequest<SubmissionResponse>(
+          SERVICE_CONFIG.FORM_SUBMISSION_ENDPOINT,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${await this.getAuthToken()}`,
+            },
+            body: JSON.stringify(submissionPayload),
+          }
+        );
+      });
+
+      if (response.success) {
+        // Store API configuration locally for quick access
+        await this.storeApiConfiguration(apiNumber, formData);
+        
+        return {
+          success: true,
+          apiNumber: response.apiNumber || apiNumber
+        };
+      } else {
+        return {
+          success: false,
+          error: response.error || 'Form submission failed'
+        };
+      }
+
+    } catch (error) {
+      console.error('Form submission error:', error);
+      
+      // Handle specific error types
+      if (error instanceof TypeError && error.message.includes('fetch')) {
+        return {
+          success: false,
+          error: 'Network error. Please check your internet connection and try again.'
+        };
+      } else if (error instanceof Error && error.name === 'AbortError') {
+        return {
+          success: false,
+          error: 'Request timed out. Please try again.'
+        };
+      } else {
+        return {
+          success: false,
+          error: 'An unexpected error occurred. Please try again.'
+        };
+      }
+    }
+  },
+
+  /**
+   * Handle payment processing through integrated payment gateway
+   * Supports multiple payment methods (Stripe, Apple Pay, Google Pay, etc.)
+   */
+  async handlePayment(paymentData: PaymentData): Promise<PaymentResponse> {
+    try {
+      const paymentPayload = {
+        ...paymentData,
+        currency: 'USD',
+        paymentMethods: ['card', 'apple_pay', 'google_pay'],
+        metadata: {
+          service: 'ai_call_agent_premium',
+          features: ['unlimited_questions', 'advanced_analytics', 'priority_support']
+        }
+      };
+
+      // Process payment with retry logic
+      const response = await retryWithBackoff(async () => {
+        return await makeRequest<PaymentResponse>(
+          SERVICE_CONFIG.PAYMENT_ENDPOINT,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${await this.getAuthToken()}`,
+            },
+            body: JSON.stringify(paymentPayload),
+          }
+        );
+      });
+
+      if (response.success) {
+        // Store payment confirmation
+        await this.storePaymentConfirmation(response.transactionId!);
+        
+        return {
+          success: true,
+          transactionId: response.transactionId
+        };
+      } else {
+        return {
+          success: false,
+          error: response.error || 'Payment processing failed'
+        };
+      }
+
+    } catch (error) {
+      console.error('Payment processing error:', error);
+      
+      return {
+        success: false,
+        error: 'Payment could not be processed. Please try again.'
+      };
+    }
+  },
+
+  /**
+   * Get authentication token for API requests
+   * Integrates with Supabase Auth
+   */
+  async getAuthToken(): Promise<string> {
+    try {
+      // In a real implementation, this would get the token from Supabase Auth
+      // For now, we'll simulate token retrieval
+      const { createClient } = require('@supabase/supabase-js');
+      const supabase = createClient(
+        process.env.EXPO_PUBLIC_SUPABASE_URL!,
+        process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY!
+      );
+
+      const { data: { session } } = await supabase.auth.getSession();
+      
+      if (!session?.access_token) {
+        throw new Error('No valid authentication session');
+      }
+
+      return session.access_token;
+    } catch (error) {
+      console.error('Auth token retrieval error:', error);
+      throw new Error('Authentication failed');
+    }
+  },
+
+  /**
+   * Store API configuration locally for offline access and quick retrieval
+   */
+  async storeApiConfiguration(apiNumber: string, formData: FormSubmission): Promise<void> {
+    try {
+      // In a real React Native app, you would use AsyncStorage or secure storage
+      // For now, we'll simulate local storage
+      const configData = {
+        apiNumber,
+        formData,
+        timestamp: new Date().toISOString(),
+        status: 'active'
+      };
+
+      // Simulate storing configuration
+      console.log('Storing API configuration:', configData);
+      
+      // In a real implementation:
+      // await AsyncStorage.setItem(`api_config_${apiNumber}`, JSON.stringify(configData));
+      
+    } catch (error) {
+      console.error('Failed to store API configuration:', error);
+      // Non-critical error, don't throw
+    }
+  },
+
+  /**
+   * Store payment confirmation for record keeping
+   */
+  async storePaymentConfirmation(transactionId: string): Promise<void> {
+    try {
+      const paymentRecord = {
+        transactionId,
+        amount: 97,
+        currency: 'USD',
+        status: 'completed',
+        timestamp: new Date().toISOString()
+      };
+
+      // Simulate storing payment confirmation
+      console.log('Storing payment confirmation:', paymentRecord);
+      
+      // In a real implementation:
+      // await AsyncStorage.setItem(`payment_${transactionId}`, JSON.stringify(paymentRecord));
+      
+    } catch (error) {
+      console.error('Failed to store payment confirmation:', error);
+      // Non-critical error, don't throw
+    }
+  },
+
+  /**
+   * Validate form data before submission
+   */
+  validateFormData(formData: FormSubmission): { isValid: boolean; errors: string[] } {
+    const errors: string[] = [];
+
+    // Validate required fields
+    if (!formData.name?.trim()) {
+      errors.push('Name is required');
+    }
+
+    if (!formData.email?.trim()) {
+      errors.push('Email is required');
+    } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(formData.email)) {
+      errors.push('Invalid email format');
+    }
+
+    if (!formData.phone?.trim()) {
+      errors.push('Phone number is required');
+    } else if (!/^[\+]?[1-9][\d]{3,14}$/.test(formData.phone.replace(/[\s\-\(\)]/g, ''))) {
+      errors.push('Invalid phone number format');
+    }
+
+    // Validate additional questions
+    if (!formData.additionalQuestions || formData.additionalQuestions.length < 3) {
+      errors.push('At least 3 additional questions are required');
+    }
+
+    // Check for empty questions
+    const emptyQuestions = formData.additionalQuestions.filter(q => !q.question?.trim());
+    if (emptyQuestions.length > 0) {
+      errors.push('All additional questions must have text');
+    }
+
+    return {
+      isValid: errors.length === 0,
+      errors
     };
-    message: string;
-  }>> {
-    return this.makeRequest('/book-appointment', {
-      ...payload,
-      timestamp: new Date().toISOString(),
-    });
   }
+};
 
-  private generateAIInstructions(
-    coreFields: FormField[], 
-    additionalQuestions: AdditionalQuestion[]
-  ): string {
-    const fieldDescriptions = coreFields.map(f => `${f.label} (${f.type})`).join(', ');
-    const additionalQs = additionalQuestions.map(q => q.question).join('; ');
-
-    return `
-You are a professional call agent collecting client information. Follow these guidelines:
-
-BEHAVIOR:
-- Sound human and conversational
-- Ask ONE question at a time
-- Use natural fillers: "umm", "let me see", "gotcha", "that makes sense"
-- Handle interruptions gracefully: pause, acknowledge, then continue
-- Never reveal you're AI unless directly asked
-
-COLLECTION PROCESS:
-1. Collect: ${fieldDescriptions}
-2. Ask additional questions: ${additionalQs || 'None configured'}
-3. Confirm all information accuracy
-4. Offer appointment booking
-
-GUARDRAILS:
-- Only collect the specified information
-- Don't speculate or provide business advice
-- If unsure, ask for clarification
-- Keep responses under 30 words
-- Stay professional but friendly
-
-INTERRUPTION HANDLING:
-- If client interrupts, lower your voice and pause
-- Acknowledge their input: "Oh, I understand" or "That's helpful"
-- Return to your question, rephrased differently
-- Track interruption context for natural flow
-    `.trim();
-  }
-}
-
-export const formSubmissionService = new FormSubmissionService();
+/**
+ * Export types for external use
+ */
+export type {
+  FormSubmission,
+  SubmissionResponse,
+  PaymentData,
+  PaymentResponse,
+  AdditionalQuestion
+};
