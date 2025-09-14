@@ -1,265 +1,273 @@
 import React, { useState, useEffect } from 'react';
-import {
-  View,
-  ScrollView,
-  Text,
-  Alert,
-  KeyboardAvoidingView,
-  Platform,
-} from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { useAuth } from '@supabase/auth-helpers-react';
-import { supabase } from '../lib/supabase';
-import { LeadForm } from '../components/lead_form';
-import { LoadingOverlay } from '../components/loading_overlay';
-import { ErrorBanner } from '../components/error_banner';
-import { CallScriptDisplay } from '../components/call_script_display';
-import { formSubmissionService } from '../services/form_submission_service';
-import { claudeEdgeService } from '../services/claude_edge_service';
-import type { LeadFormData, CallScript } from '../types/form_types';
+import { View, ScrollView, Text, TextInput, TouchableOpacity, Alert } from 'react-native';
+import { useNavigation } from '@react-navigation/native';
+import { formSubmissionService } from '../services/formSubmissionService';
+import { Button } from '../components/ui/button';
+import { Input } from '../components/ui/input';
+import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
+import { Badge } from '../components/ui/badge';
 
-/**
- * FormSubmissionScreen - Main screen for lead form submission
- * 
- * Features:
- * - Dark mode by default
- * - Mobile-first responsive design
- * - Form validation with Zod
- * - Supabase Auth integration
- * - Claude Edge Function integration for call script generation
- * - Retry logic for failed API calls
- * - Loading and error states
- * 
- * Future AI Enhancement Opportunities:
- * - Add AI-powered form field suggestions based on user context
- * - Implement smart form validation with AI feedback
- * - Add voice-to-text input for notes field
- * - Integrate AI-powered lead scoring
- */
+interface FormField {
+  id: string;
+  label: string;
+  type: 'text' | 'email' | 'phone';
+  required: boolean;
+  value: string;
+}
+
+interface AdditionalQuestion {
+  id: string;
+  question: string;
+  type: 'text' | 'select' | 'boolean';
+  options?: string[];
+  required: boolean;
+}
+
 export const FormSubmissionScreen: React.FC = () => {
-  const { session, loading: authLoading } = useAuth();
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [isGeneratingScript, setIsGeneratingScript] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [callScript, setCallScript] = useState<CallScript | null>(null);
-  const [retryCount, setRetryCount] = useState(0);
+  const navigation = useNavigation();
+  const [isLoading, setIsLoading] = useState(false);
+  const [isPaid, setIsPaid] = useState(false);
+  const [agentId, setAgentId] = useState<string>('');
+  const [formLink, setFormLink] = useState<string>('');
+  const [webhookLink, setWebhookLink] = useState<string>('');
 
-  // Maximum retry attempts for API calls
-  const MAX_RETRIES = 3;
+  // Core form fields
+  const [coreFields, setCoreFields] = useState<FormField[]>([
+    { id: 'name', label: 'Full Name', type: 'text', required: true, value: '' },
+    { id: 'email', label: 'Email', type: 'email', required: true, value: '' },
+    { id: 'phone', label: 'Phone Number', type: 'phone', required: true, value: '' },
+    { id: 'custom1', label: 'Company Name', type: 'text', required: true, value: '' },
+    { id: 'custom2', label: 'Industry', type: 'text', required: true, value: '' },
+    { id: 'custom3', label: 'Budget Range', type: 'text', required: true, value: '' }
+  ]);
 
-  useEffect(() => {
-    // Clear error when component mounts or session changes
-    if (session) {
-      setError(null);
-    }
-  }, [session]);
+  // Additional questions (post-payment)
+  const [additionalQuestions, setAdditionalQuestions] = useState<AdditionalQuestion[]>([]);
+  const [questionAnswers, setQuestionAnswers] = useState<Record<string, string>>({});
 
-  /**
-   * Handle form submission with retry logic
-   * Future AI Enhancement: Add intelligent retry timing based on error type
-   */
-  const handleFormSubmit = async (formData: LeadFormData) => {
-    if (!session?.user?.id) {
-      setError('Authentication required. Please log in.');
+  const updateFieldValue = (fieldId: string, value: string) => {
+    setCoreFields(prev => prev.map(field => 
+      field.id === fieldId ? { ...field, value } : field
+    ));
+  };
+
+  const isFormValid = () => {
+    return coreFields.every(field => field.required ? field.value.trim() !== '' : true);
+  };
+
+  const handlePayment = async () => {
+    if (!isFormValid()) {
+      Alert.alert('Error', 'Please fill in all required fields');
       return;
     }
 
-    setIsSubmitting(true);
-    setError(null);
-    
+    setIsLoading(true);
     try {
-      // Submit form data with retry logic
-      const leadId = await submitWithRetry(formData);
-      
-      // Generate call script after successful submission
-      await generateCallScript(formData, leadId);
-      
-      Alert.alert(
-        'Success!', 
-        'Lead information submitted and call script generated successfully.'
-      );
-      
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'An unexpected error occurred';
-      setError(errorMessage);
-      Alert.alert('Error', errorMessage);
-    } finally {
-      setIsSubmitting(false);
-      setRetryCount(0);
-    }
-  };
-
-  /**
-   * Submit form data with exponential backoff retry logic
-   * Future AI Enhancement: Use AI to predict optimal retry timing
-   */
-  const submitWithRetry = async (formData: LeadFormData): Promise<string> => {
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        setRetryCount(attempt);
-        
-        const leadId = await formSubmissionService.submitLead({
-          ...formData,
-          userId: session!.user.id,
-        });
-        
-        return leadId;
-        
-      } catch (error) {
-        if (attempt === MAX_RETRIES) {
-          throw new Error(`Failed to submit lead after ${MAX_RETRIES + 1} attempts`);
-        }
-        
-        // Exponential backoff: 1s, 2s, 4s
-        const delay = Math.pow(2, attempt) * 1000;
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
-    
-    throw new Error('Unexpected error in retry logic');
-  };
-
-  /**
-   * Generate call script using Claude Edge Function
-   * Future AI Enhancement: Cache scripts and use context-aware generation
-   */
-  const generateCallScript = async (formData: LeadFormData, leadId: string) => {
-    setIsGeneratingScript(true);
-    
-    try {
-      const script = await claudeEdgeService.generateCallScript({
-        leadName: formData.name,
-        leadEmail: formData.email,
-        leadPhone: formData.phone,
-        notes: formData.notes,
-        leadId,
-        userId: session!.user.id,
+      const result = await formSubmissionService.processPayment({
+        fields: coreFields,
+        agentType: 'form_submission'
       });
-      
-      setCallScript(script);
+
+      if (result.error) {
+        Alert.alert('Payment Error', result.error);
+        return;
+      }
+
+      setIsPaid(true);
+      setAgentId(result.data.agentId);
+      setFormLink(result.data.formLink);
+      setWebhookLink(result.data.webhookLink || '');
       
     } catch (error) {
-      console.error('Failed to generate call script:', error);
-      // Don't throw here - form submission was successful
-      setError('Lead submitted successfully, but call script generation failed. You can retry later.');
+      Alert.alert('Error', 'Payment processing failed');
     } finally {
-      setIsGeneratingScript(false);
+      setIsLoading(false);
     }
   };
 
-  /**
-   * Clear error state
-   */
-  const clearError = () => setError(null);
+  const addQuestion = () => {
+    if (additionalQuestions.length >= 10) {
+      Alert.alert('Limit Reached', 'Maximum 10 additional questions allowed');
+      return;
+    }
 
-  /**
-   * Retry call script generation
-   */
-  const retryScriptGeneration = async () => {
-    if (!callScript) return;
-    
-    setError(null);
-    await generateCallScript(
-      {
-        name: callScript.leadName,
-        email: callScript.leadEmail || '',
-        phone: callScript.leadPhone || '',
-        notes: callScript.notes || '',
-      },
-      callScript.leadId
-    );
+    const newQuestion: AdditionalQuestion = {
+      id: `q_${Date.now()}`,
+      question: '',
+      type: 'text',
+      required: false
+    };
+
+    setAdditionalQuestions(prev => [...prev, newQuestion]);
   };
 
-  // Show loading screen while auth is loading
-  if (authLoading) {
-    return (
-      <SafeAreaView className="flex-1 bg-gray-900">
-        <LoadingOverlay message="Loading authentication..." />
-      </SafeAreaView>
-    );
-  }
+  const updateQuestion = (questionId: string, updates: Partial<AdditionalQuestion>) => {
+    setAdditionalQuestions(prev => prev.map(q => 
+      q.id === questionId ? { ...q, ...updates } : q
+    ));
+  };
 
-  // Show authentication required message
-  if (!session) {
-    return (
-      <SafeAreaView className="flex-1 bg-gray-900 justify-center items-center px-6">
-        <View className="bg-gray-800 rounded-lg p-6 w-full max-w-md">
-          <Text className="text-white text-xl font-bold mb-4 text-center">
-            Authentication Required
-          </Text>
-          <Text className="text-gray-300 text-center">
-            Please log in to submit lead information and generate call scripts.
-          </Text>
-        </View>
-      </SafeAreaView>
-    );
-  }
+  const removeQuestion = (questionId: string) => {
+    setAdditionalQuestions(prev => prev.filter(q => q.id !== questionId));
+    const newAnswers = { ...questionAnswers };
+    delete newAnswers[questionId];
+    setQuestionAnswers(newAnswers);
+  };
+
+  const deployAgent = async () => {
+    setIsLoading(true);
+    try {
+      const result = await formSubmissionService.deployAgent({
+        agentId,
+        coreFields,
+        additionalQuestions,
+        formLink,
+        webhookLink
+      });
+
+      if (result.error) {
+        Alert.alert('Deployment Error', result.error);
+        return;
+      }
+
+      Alert.alert('Success!', 'Your Form Submission Call Agent is now active', [
+        { text: 'OK', onPress: () => navigation.goBack() }
+      ]);
+      
+    } catch (error) {
+      Alert.alert('Error', 'Agent deployment failed');
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   return (
-    <SafeAreaView className="flex-1 bg-gray-900">
-      <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        className="flex-1"
-      >
-        <ScrollView
-          className="flex-1"
-          contentContainerStyle={{ flexGrow: 1 }}
-          keyboardShouldPersistTaps="handled"
-          showsVerticalScrollIndicator={false}
-        >
-          {/* Header */}
-          <View className="px-6 py-4 border-b border-gray-700">
-            <Text className="text-white text-2xl font-bold">
-              Submit Lead Information
-            </Text>
-            <Text className="text-gray-400 mt-1">
-              Generate personalized call scripts with AI
-            </Text>
-          </View>
-
-          {/* Error Banner */}
-          {error && (
-            <ErrorBanner
-              message={error}
-              onDismiss={clearError}
-              onRetry={callScript ? retryScriptGeneration : undefined}
-            />
-          )}
-
-          {/* Main Content */}
-          <View className="flex-1 px-6 py-6">
-            {/* Lead Form */}
-            <LeadForm
-              onSubmit={handleFormSubmit}
-              isSubmitting={isSubmitting}
-              retryCount={retryCount}
-              maxRetries={MAX_RETRIES}
-            />
-
-            {/* Call Script Display */}
-            {callScript && (
-              <View className="mt-8">
-                <CallScriptDisplay
-                  script={callScript}
-                  isGenerating={isGeneratingScript}
-                  onRegenerate={retryScriptGeneration}
+    <ScrollView className="flex-1 bg-gray-900 p-4">
+      <Card className="bg-gray-800 border-gray-700">
+        <CardHeader>
+          <CardTitle className="text-white text-xl">Form Submission Call Agent</CardTitle>
+          <Text className="text-gray-400">
+            Collect client information and book appointments automatically
+          </Text>
+        </CardHeader>
+        
+        <CardContent className="space-y-6">
+          {/* Core Form Fields */}
+          <View className="space-y-4">
+            <Text className="text-white text-lg font-semibold">Required Information</Text>
+            {coreFields.map((field) => (
+              <View key={field.id}>
+                <Text className="text-gray-300 mb-2">{field.label}</Text>
+                <Input
+                  className="bg-gray-700 border-gray-600 text-white"
+                  placeholder={`Enter ${field.label.toLowerCase()}`}
+                  value={field.value}
+                  onChangeText={(value) => updateFieldValue(field.id, value)}
+                  keyboardType={
+                    field.type === 'email' ? 'email-address' :
+                    field.type === 'phone' ? 'phone-pad' : 'default'
+                  }
                 />
               </View>
-            )}
+            ))}
           </View>
-        </ScrollView>
 
-        {/* Loading Overlay */}
-        {(isSubmitting || isGeneratingScript) && (
-          <LoadingOverlay
-            message={
-              isSubmitting
-                ? `Submitting lead information${retryCount > 0 ? ` (Retry ${retryCount}/${MAX_RETRIES})` : ''}...`
-                : 'Generating call script with AI...'
-            }
-          />
-        )}
-      </KeyboardAvoidingView>
-    </SafeAreaView>
+          {/* Payment/Activation Button */}
+          {!isPaid && (
+            <Button
+              className={`w-full ${isFormValid() ? 'bg-blue-600' : 'bg-gray-600'}`}
+              disabled={!isFormValid() || isLoading}
+              onPress={handlePayment}
+            >
+              <Text className="text-white font-semibold">
+                {isLoading ? 'Processing...' : 'Activate Agent ($29/month)'}
+              </Text>
+            </Button>
+          )}
+
+          {/* Post-Payment Configuration */}
+          {isPaid && (
+            <>
+              <View className="space-y-4">
+                <View className="flex-row items-center justify-between">
+                  <Text className="text-white text-lg font-semibold">Agent Links</Text>
+                  <Badge className="bg-green-600">
+                    <Text className="text-white text-xs">ACTIVE</Text>
+                  </Badge>
+                </View>
+                
+                <View>
+                  <Text className="text-gray-300 mb-2">Form Link</Text>
+                  <Text className="text-blue-400 text-xs bg-gray-700 p-2 rounded">
+                    {formLink}
+                  </Text>
+                </View>
+
+                {webhookLink && (
+                  <View>
+                    <Text className="text-gray-300 mb-2">Webhook URL</Text>
+                    <Text className="text-blue-400 text-xs bg-gray-700 p-2 rounded">
+                      {webhookLink}
+                    </Text>
+                  </View>
+                )}
+              </View>
+
+              {/* Additional Questions */}
+              <View className="space-y-4">
+                <View className="flex-row items-center justify-between">
+                  <Text className="text-white text-lg font-semibold">
+                    Additional Questions ({additionalQuestions.length}/10)
+                  </Text>
+                  <TouchableOpacity
+                    onPress={addQuestion}
+                    disabled={additionalQuestions.length >= 10}
+                    className={`px-4 py-2 rounded ${
+                      additionalQuestions.length >= 10 ? 'bg-gray-600' : 'bg-blue-600'
+                    }`}
+                  >
+                    <Text className="text-white text-sm">+ Add</Text>
+                  </TouchableOpacity>
+                </View>
+
+                {additionalQuestions.map((question, index) => (
+                  <Card key={question.id} className="bg-gray-700 border-gray-600">
+                    <CardContent className="p-4 space-y-3">
+                      <View className="flex-row justify-between items-center">
+                        <Text className="text-gray-300">Question {index + 1}</Text>
+                        <TouchableOpacity
+                          onPress={() => removeQuestion(question.id)}
+                          className="bg-red-600 px-2 py-1 rounded"
+                        >
+                          <Text className="text-white text-xs">Remove</Text>
+                        </TouchableOpacity>
+                      </View>
+                      
+                      <Input
+                        className="bg-gray-600 border-gray-500 text-white"
+                        placeholder="What question should the agent ask?"
+                        value={question.question}
+                        onChangeText={(text) => updateQuestion(question.id, { question: text })}
+                      />
+                    </CardContent>
+                  </Card>
+                ))}
+              </View>
+
+              {/* Deploy Button */}
+              <Button
+                className="w-full bg-green-600"
+                disabled={isLoading}
+                onPress={deployAgent}
+              >
+                <Text className="text-white font-semibold">
+                  {isLoading ? 'Deploying...' : 'Deploy Call Agent'}
+                </Text>
+              </Button>
+            </>
+          )}
+        </CardContent>
+      </Card>
+    </ScrollView>
   );
 };
